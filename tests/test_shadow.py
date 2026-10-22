@@ -19,7 +19,7 @@ def setup(plugin, monkeypatch, tmp_path, **settings):
             calls.append(name)
             return [{'url': 'https://' + name + '.example/a', 'title': name, 'description': 'x' * 500}]
         return call
-    p = f.SearchFusionWebSearchProvider(settings=f.FusionSettings(**settings),
+    p = f.SearchFusionWebSearchProvider(settings=f.FusionSettings(**{'shadow_enabled': True, **settings}),
         searchers={name: search(name) for name in ('serper', 'deepseek')})
     result = {'data': {'web': [{'url': 'https://serper.example/a', 'title': 'serper', 'description': ''}]}}
     context = {'session_id': 's', 'turn_id': 't', 'batch_index': 2}
@@ -214,7 +214,7 @@ def test_report_readonly_and_unknown_session(plugin, tmp_path):
 def test_shadow_configuration(plugin, monkeypatch):
     import sys
     f = plugin.fusion
-    assert f.FusionSettings().shadow_enabled
+    assert not f.FusionSettings().shadow_enabled
     assert f.FusionSettings().shadow_daily_cap == 300
     monkeypatch.setattr(sys.modules['hermes_cli.config'], 'load_config', lambda: {
         'plugins': {'entries': {'search-fusion': {'fusion': {

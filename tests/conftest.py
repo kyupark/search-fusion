@@ -47,6 +47,9 @@ def plugin(monkeypatch, tmp_path):
     import socket
     import subprocess
     import urllib.request
+    # Synthetic DNS is explicit and deterministic; the socket connect guard below remains.
+    monkeypatch.setattr(socket, 'getaddrinfo', lambda host, port=None, *a, **kw:
+                        [(socket.AF_INET, socket.SOCK_STREAM, 6, '', ('93.184.216.34', port or 443))])
     hits = []
     def forbidden(*args, **kwargs):
         # pytest's Failed is a BaseException, so plugin `except Exception`

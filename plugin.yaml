@@ -1,6 +1,6 @@
 name: search-fusion
 version: 0.6.0
-description: "Update-safe Search Fusion: adaptive Exa + TinyFish + paced Brave fusion with Firecrawl fallback, TinyFish MCP search suppression, and Defuddle-first web_fetch routing."
+description: "Bounded TinyFish/Serper/Brave/Tavily/DeepSeek/DDGS search fusion, turn routing, and guarded HTTP plus local Defuddle extraction."
 author: Kyu Park
 kind: standalone
 provides_web_providers:

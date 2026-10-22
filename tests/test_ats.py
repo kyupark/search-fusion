@@ -45,18 +45,18 @@ CASES = [
 def test_ats_returns_posting_before_generic_extraction(plugin, monkeypatch, url, endpoint, payload, method, max_chars):
     calls = []
 
-    def get(req, timeout):
+    def get(target, timeout, max_bytes, headers):
+        req = urllib.request.Request(target)
         calls.append(req.full_url)
         assert req.full_url == endpoint and req.get_method() == 'GET' and timeout == 7
         response = io.BytesIO(json.dumps(payload).encode())
         response.headers = {'content-type': 'application/json'}
         response.geturl = lambda: endpoint
-        return response
+        return response.getvalue(), response.headers, response.geturl()
 
-    monkeypatch.setattr(urllib.request, 'urlopen', get)
+    monkeypatch.setattr(plugin.tools, 'guarded_fetch', get)
     m = plugin.frugal_extract
     monkeypatch.setattr(m, '_run_defuddle', lambda *a: pytest.fail('ATS success must skip Defuddle'))
-    monkeypatch.setattr(m, '_firecrawl_provider', lambda: pytest.fail('ATS success must skip Firecrawl'))
     cfg = dict(firecrawl_hosts=set(), skip_firecrawl_hosts=set(), timeout_s=7,
                max_chars=max_chars, min_local_chars=200)
     out = asyncio.run(m.FrugalExtractProvider(cfg).extract([url]))[0]
@@ -83,7 +83,8 @@ def test_ats_failure_preserves_generic_fallback(plugin, monkeypatch, url, endpoi
         url = url.replace('.com/', '.com.evil/', 1)
     calls = []
 
-    def get(req, timeout):
+    def get(target, timeout, max_bytes, headers):
+        req = urllib.request.Request(target)
         calls.append(req.full_url)
         if req.full_url == endpoint:
             if failure == 'http':
@@ -102,13 +103,12 @@ def test_ats_failure_preserves_generic_fallback(plugin, monkeypatch, url, endpoi
         response = io.BytesIO(body.encode())
         response.headers = {'content-type': ctype}
         response.geturl = lambda: req.full_url
-        return response
+        return response.getvalue(), response.headers, response.geturl()
 
-    monkeypatch.setattr(urllib.request, 'urlopen', get)
+    monkeypatch.setattr(plugin.tools, 'guarded_fetch', get)
     m = plugin.frugal_extract
     generic = 'Existing generic extraction. ' * 10
     monkeypatch.setattr(m, '_run_defuddle', lambda *a: dict(ok=True, content=generic))
-    monkeypatch.setattr(m, '_firecrawl_provider', lambda: pytest.fail('Generic success must skip Firecrawl'))
     cfg = dict(firecrawl_hosts=set(), skip_firecrawl_hosts=set(), timeout_s=7,
                max_chars=1234, min_local_chars=200)
     out = asyncio.run(m.FrugalExtractProvider(cfg).extract([url]))[0]

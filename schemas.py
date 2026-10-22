@@ -6,10 +6,9 @@ WEB_FETCH_SCHEMA = {
         "Fetch and extract content from a known URL using the plugin's routing policy. "
         "Use this FIRST for known URLs, articles, documentation pages, and normal web pages. "
         "Routing is enforced in code: raw/API/plain-text endpoints use direct HTTP, "
-        "normal pages use local Defuddle first, and TinyFish Fetch is only used as a "
-        "fallback when Defuddle fails or rendered extraction is explicitly needed. "
-        "This tool does not use paid TinyFish browser/agent automation. For search/discovery, "
-        "use TinyFish Search or web_search instead. For login/forms/visual interaction, use browser tools."
+        "normal pages use local Defuddle on HTML fetched with public-IP and redirect checks. "
+        "Remote fetching is disabled because remote redirect destinations cannot be validated. "
+        "For search/discovery use web_search. For rendered pages, login or forms use browser tools."
     ),
     "parameters": {
         "type": "object",
@@ -23,7 +22,7 @@ WEB_FETCH_SCHEMA = {
                 "enum": ["auto", "article", "raw", "rendered"],
                 "description": (
                     "Routing hint. auto chooses from URL shape. article forces Defuddle-first. "
-                    "raw forces direct HTTP. rendered tries Defuddle then TinyFish Fetch fallback."
+                    "raw forces direct HTTP. Legacy rendered mode returns browser guidance without fetching."
                 ),
                 "default": "auto",
             },
@@ -39,7 +38,7 @@ WEB_FETCH_SCHEMA = {
             },
             "ttl": {
                 "type": "integer",
-                "description": "Optional TinyFish cache freshness tolerance in seconds when TinyFish fallback is used.",
+                "description": "Deprecated compatibility parameter; ignored (remote fetching is disabled).",
             },
         },
         "required": ["url"],

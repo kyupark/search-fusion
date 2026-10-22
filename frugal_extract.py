@@ -1,18 +1,8 @@
-"""Frugal extract provider: local-first ``web_extract`` with Firecrawl as last resort.
+"""Public-page extraction: guarded ATS JSON, direct HTTP, then offline Defuddle.
 
-Firecrawl bills per scrape and the free tier caps at ~20 req/min. Most of what Hermes
-extracts (raw GitHub files, JSON/CSV/RSS endpoints, docs pages, articles) needs neither a
-headless renderer nor an anti-bot proxy. This provider walks a cost ladder per URL:
-
-0. ``ats_*``       — public posting JSON for Ashby, Workable, and Workday job URLs.
-1. ``direct_http``  — raw hosts / raw-looking paths (``_looks_raw``) or non-HTML content types.
-2. ``defuddle``     — local article/docs extraction (same binary ``web_fetch`` uses).
-3. ``firecrawl``    — only when both local paths fail (JS-only pages, bot walls, 403s), and
-   only if the Firecrawl provider is registered and available.
-
-Domains listed under ``plugins.entries.search-fusion.frugal_extract.firecrawl_hosts`` skip the
-local ladder (known JS-heavy sites). ``skip_firecrawl_hosts`` never fall through to Firecrawl.
-Per-URL ``method`` is recorded in the result's ``metadata`` so usage can be audited in logs.
+All local HTTP requests resolve and pin public IPs and validate every redirect hop.
+Remote Firecrawl/TinyFish fetching is intentionally unavailable: these APIs do not
+expose redirect hops for validation. A browser is needed for JS or authenticated pages.
 """
 
 from __future__ import annotations
@@ -26,15 +16,16 @@ from urllib.parse import urlparse
 
 from agent.web_search_provider import WebSearchProvider
 
+from .url_safety import UnsafeURL, validate_url
 from .tools import _clip, _direct_http, _html_to_text, _looks_raw, _run_defuddle
 
 logger = logging.getLogger(__name__)
 
 NAME = "frugal-extract"
 # Empty Defuddle output on a real page is usually a JS shell or a bot wall; below this the
-# local result is not trusted and Firecrawl gets a turn.
+# local result is not trusted and the caller receives browser guidance.
 _MIN_LOCAL_CHARS = 200
-# Definitive client errors: Firecrawl cannot conjure a page that does not exist / needs auth.
+# Definitive client errors: a missing or authenticated page needs caller intervention.
 _FINAL_HTTP = {"401", "404", "410"}
 _BOILERPLATE_MARKERS = (
     "enable javascript",
@@ -70,6 +61,10 @@ def _ats_markdown(html: str) -> str:
 
 
 def _ats_extract(url: str, timeout: int, max_chars: int, attempts: list[str]) -> dict[str, Any] | None:
+    try:
+        validate_url(url)
+    except UnsafeURL:
+        return None
     parsed = urlparse(url)
     if parsed.scheme not in {"http", "https"}:
         return None
@@ -138,18 +133,10 @@ def _settings() -> dict[str, Any]:
     except Exception:  # noqa: BLE001
         raw = {}
     return {
-        "firecrawl_hosts": {str(h).lower().strip() for h in (raw.get("firecrawl_hosts") or []) if h},
-        "skip_firecrawl_hosts": {str(h).lower().strip() for h in (raw.get("skip_firecrawl_hosts") or []) if h},
-        "firecrawl_only_hosts": {str(h).lower().strip() for h in (raw.get("firecrawl_only_hosts") or []) if h},
         "timeout_s": int(raw.get("timeout_s") or 30),
         "max_chars": int(raw.get("max_chars") or 200_000),
         "min_local_chars": int(raw.get("min_local_chars") or _MIN_LOCAL_CHARS),
     }
-
-
-def _host_matches(host: str, patterns: set[str]) -> bool:
-    host = host.lower()
-    return any(host == p or host.endswith("." + p) for p in patterns)
 
 
 def _looks_like_shell(content: str, min_chars: int) -> str | None:
@@ -183,22 +170,8 @@ def _error(url: str, error: str, attempts: list[str]) -> dict[str, Any]:
     return {"url": url, "title": "", "content": "", "raw_content": "", "error": error, "metadata": {"attempts": attempts}}
 
 
-def _firecrawl_provider():
-    from agent.web_search_registry import get_provider
-
-    provider = get_provider("firecrawl")
-    if provider is None or not provider.supports_extract():
-        return None
-    try:
-        if not provider.is_available():
-            return None
-    except Exception:  # noqa: BLE001
-        return None
-    return provider
-
-
 class FrugalExtractProvider(WebSearchProvider):
-    """Extract-only provider: ATS JSON → direct HTTP → Defuddle → Firecrawl."""
+    """Extract-only provider: guarded ATS JSON → direct HTTP → offline Defuddle."""
 
     def __init__(self, settings_override: dict[str, Any] | None = None):
         self._settings_override = settings_override
@@ -209,7 +182,7 @@ class FrugalExtractProvider(WebSearchProvider):
 
     @property
     def display_name(self) -> str:
-        return "Frugal Extract (local-first, Firecrawl fallback)"
+        return "Frugal Extract (guarded local extraction)"
 
     def is_available(self) -> bool:
         return True
@@ -233,7 +206,7 @@ class FrugalExtractProvider(WebSearchProvider):
         if ats is not None:
             return ats, attempts, "", False
         # Rung 1: plain GET. Non-HTML bodies (JSON/CSV/XML/plain text) are final here; a definitive
-        # HTTP 4xx (404/410/401) is also final — a paid scrape of a missing page is pure waste.
+        # HTTP 4xx (404/410/401) is also final.
         direct = _direct_http(url, timeout, max_chars)
         attempts.append("direct_http")
         ctype = str(direct.get("content_type") or "").lower()
@@ -260,42 +233,16 @@ class FrugalExtractProvider(WebSearchProvider):
         return None, attempts, last_error, True
 
     async def _one(self, url: str, format: str | None, cfg: dict[str, Any]) -> dict[str, Any]:
-        host = urlparse(url).netloc.lower()
-        force_firecrawl = _host_matches(host, cfg["firecrawl_hosts"])
-        never_firecrawl = _host_matches(host, cfg["skip_firecrawl_hosts"]) or bool(
-            cfg.get("firecrawl_only_hosts") and not _host_matches(host, cfg["firecrawl_only_hosts"])
-        )
-        if never_firecrawl:
-            force_firecrawl = False
-        attempts: list[str] = []
-        last_error = ""
-        if not force_firecrawl:
-            result, attempts, last_error, escalate = await asyncio.to_thread(self._local, url, cfg)
-            if result is not None:
-                method = result.get("method") or attempts[-1]
-                logger.info("frugal-extract: %s via %s (%s)", url, method, "/".join(attempts))
-                return _entry(url, result, method, attempts)
-            if not escalate:
-                logger.info("frugal-extract: %s final local failure, not escalating (%s)", url, last_error)
-                return _error(url, last_error, attempts)
-        if never_firecrawl:
-            logger.info("frugal-extract: %s local failed and host is skip_firecrawl (%s)", url, last_error)
-            return _error(url, f"local extraction failed and Firecrawl is disabled for this host: {last_error}", attempts)
-        provider = _firecrawl_provider()
-        if provider is None:
-            logger.warning("frugal-extract: %s local failed and Firecrawl unavailable (%s)", url, last_error)
-            return _error(url, f"local extraction failed and Firecrawl is unavailable: {last_error}", attempts)
-        attempts.append("firecrawl")
-        why = "forced by firecrawl_hosts" if force_firecrawl else last_error
-        logger.info("frugal-extract: %s escalating to Firecrawl (%s)", url, why)
-        results = provider.extract([url], format=format)
-        if asyncio.iscoroutine(results):
-            results = await results
-        entry = dict(results[0]) if results else _error(url, "Firecrawl returned no result", attempts)
-        meta = dict(entry.get("metadata") or {}) if isinstance(entry.get("metadata"), dict) else {}
-        meta.update({"extract_method": "firecrawl", "attempts": attempts, "escalation_reason": why})
-        entry["metadata"] = meta
-        return entry
+        try:
+            validate_url(url)
+        except UnsafeURL as exc:
+            return _error(url, str(exc), [])
+        result, attempts, last_error, _ = await asyncio.to_thread(self._local, url, cfg)
+        if result is not None:
+            method = result.get("method") or attempts[-1]
+            logger.info("frugal-extract: %s via %s (%s)", url, method, "/".join(attempts))
+            return _entry(url, result, method, attempts)
+        return _error(url, last_error + "; remote extraction disabled: redirect safety cannot be enforced", attempts)
 
     async def extract(self, urls: list[str], **kwargs: Any) -> list[dict[str, Any]]:
         cfg = self._cfg()

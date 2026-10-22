@@ -7,6 +7,11 @@ import re
 import sqlite3
 from urllib.parse import urlsplit, urlunsplit
 
+try:
+    from .paths import hermes_home
+except ImportError:
+    from paths import hermes_home
+
 
 def canonical(url):
     try:
@@ -68,8 +73,8 @@ def report(paths, db=None):
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description=__doc__)
-    default = Path.home() / '.hermes/state/search-fusion/shadow.jsonl'
+    default = hermes_home() / 'state/search-fusion/shadow.jsonl'
     parser.add_argument('logs', nargs='*', type=Path, default=[default.with_name('shadow.jsonl.1'), default])
-    parser.add_argument('--db', type=Path, default=Path.home() / '.hermes/state.db')
+    parser.add_argument('--db', type=Path, default=hermes_home() / 'state.db')
     args = parser.parse_args()
     print(json.dumps(report(args.logs, args.db), indent=2))

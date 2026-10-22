@@ -7,7 +7,7 @@ def test_first_and_recovered_batches_do_not_shadow(plugin, monkeypatch):
     f = plugin.fusion
     submitted = []
     monkeypatch.setattr(f.SHADOW, 'submit', lambda *a: submitted.append(a))
-    p = f.SearchFusionWebSearchProvider(settings=f.FusionSettings(), searchers={
+    p = f.SearchFusionWebSearchProvider(settings=f.FusionSettings(shadow_enabled=True), searchers={
         'serper': lambda *a: [],
         'deepseek': lambda *a: [{'url': 'https://aux.example'}]})
     for batch in ('first', 'later'):
@@ -22,7 +22,7 @@ def test_queued_job_honors_kill_switch(plugin, monkeypatch, tmp_path):
     s = importlib.import_module(f.__package__ + '.shadow')
     r = s.ShadowRunner(tmp_path, autostart=False)
     calls = []
-    p = f.SearchFusionWebSearchProvider(settings=f.FusionSettings(), searchers={
+    p = f.SearchFusionWebSearchProvider(settings=f.FusionSettings(shadow_enabled=True), searchers={
         'deepseek': lambda *a: calls.append(a) or []})
     monkeypatch.setenv('SEARCH_FUSION_SHADOW', '1')
     assert r.submit(p, 'q', 4, p._settings(), {'data': {'web': []}}, {})
@@ -40,7 +40,7 @@ def test_shadow_error_bodies_never_logged(plugin, monkeypatch, tmp_path):
     r = s.ShadowRunner(tmp_path, autostart=False)
     def fail(*a):
         raise RuntimeError('PRIVATE_BODY API_KEY=FAKE_SECRET')
-    p = f.SearchFusionWebSearchProvider(settings=f.FusionSettings(), searchers={'deepseek': fail})
+    p = f.SearchFusionWebSearchProvider(settings=f.FusionSettings(shadow_enabled=True), searchers={'deepseek': fail})
     monkeypatch.setenv('SEARCH_FUSION_SHADOW', '1')
     assert r.submit(p, 'q', 4, p._settings(), {'data': {'web': []}}, {})
     job = r.queue.get_nowait()

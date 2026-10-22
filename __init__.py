@@ -1,13 +1,9 @@
 """Combined web routing plugin: bounded fusion search + Defuddle-first web_fetch.
 
-Update-safe local architecture guardrails:
-- Register a self-contained ``search-fusion`` provider that fuses Exa,
-  TinyFish, and locally paced Brave under strict deadlines, with Firecrawl as
-  an availability fallback when the primary fusion returns no useful result.
-- Hide direct TinyFish MCP Search from the model surface. TinyFish Search is a
-  discovery backend candidate, not an agent-facing tool.
-- Hide direct TinyFish MCP Fetch from the model surface while preserving it as
-  the internal ``web_fetch`` fallback.
+Register the active TinyFish/Serper/Brave/Tavily/DeepSeek/DDGS search roster
+under bounded deadlines, plus guarded HTTP and local Defuddle extraction.
+Direct TinyFish MCP tools remain hidden; remote fetch redirects cannot be
+validated by this plugin, so extraction never delegates to remote backends.
 """
 
 from __future__ import annotations
@@ -36,16 +32,16 @@ _WEB_TOOLS_PATCHED = False
 
 def _check_requirements() -> bool:
     # Always register the router. Individual routes return structured diagnostics
-    # if Defuddle, TinyFish, or an underlying search provider is unavailable.
+    # if Defuddle or an underlying search provider is unavailable.
     return True
 
 
 def _capture_existing_tinyfish_direct_tools() -> None:
     """Remove direct TinyFish Search/Fetch tools from model surface.
 
-    Fetch entries are retained internally so ``web_fetch`` can use them as the
-    final rendered-content fallback. Search entries are intentionally hidden and
-    unused; discovery should go through ``web_search`` / ``search-fusion``.
+    Fetch entries are retained for registry compatibility, but are never used by
+    extraction because remote redirect targets cannot be checked. Discovery
+    goes through ``web_search`` / ``search-fusion``.
     """
     for name in _TINYFISH_DIRECT_TOOL_NAMES:
         entry = registry.get_entry(name)
@@ -102,8 +98,8 @@ def _block_direct_tinyfish_tools(tool_name: str, args: dict | None = None, **kwa
         return {
             "action": "block",
             "message": (
-                "Use web_fetch first for known URLs. the plugin's routing policy is "
-                "Defuddle first, with TinyFish Fetch only as the web_fetch fallback."
+                "Use web_fetch for guarded HTTP and local Defuddle extraction. "
+                "Remote fetch redirects cannot be validated by this plugin."
             ),
         }
     if tool_name in _TINYFISH_SEARCH_TOOL_NAMES:
@@ -148,7 +144,7 @@ def _register_search_fusion(ctx) -> None:
     ctx.register_web_search_provider(SearchFusionWebSearchProvider())
     logger.info("search-fusion: registered local bounded search-fusion provider")
     ctx.register_web_search_provider(FrugalExtractProvider())
-    logger.info("search-fusion: registered frugal-extract provider (local-first, Firecrawl last resort)")
+    logger.info("search-fusion: registered frugal-extract provider (guarded HTTP and local Defuddle)")
     _patch_web_tools_backend_availability()
 
 
@@ -169,7 +165,7 @@ def register(ctx) -> None:
         schema=WEB_FETCH_SCHEMA,
         handler=_handler,
         check_fn=_check_requirements,
-        description="Defuddle-first known-URL fetch/extraction router with TinyFish fallback.",
+        description="Known-URL extraction using guarded HTTP and local Defuddle.",
         emoji="🌐",
     )
     ctx.register_hook("pre_tool_call", _block_direct_tinyfish_tools)

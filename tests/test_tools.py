@@ -24,10 +24,8 @@ def test_html(plugin):
     ('raw',False,(True,True,True),['direct_http'],True,'direct_http'),
     ('raw',False,(False,True,True),['direct_http'],False,None),
     ('auto',True,(False,True,True),['direct_http','defuddle'],True,'defuddle'),
-    ('auto',False,(False,False,True),['defuddle','tinyfish_fetch'],True,'tinyfish_fetch'),
-    ('rendered',False,(False,True,True),['defuddle','tinyfish_fetch'],True,'tinyfish_fetch'),
-    ('rendered',False,(False,True,False),['defuddle','tinyfish_fetch'],True,'defuddle'),
-    ('auto',False,(False,False,False),['defuddle','tinyfish_fetch'],False,None),
+    ('auto',False,(False,False,True),['defuddle','direct_http'],False,None),
+    ('auto',False,(False,False,False),['defuddle','direct_http'],False,None),
 ])
 def test_ladder(plugin,monkeypatch,mode,raw,states,order,success,method):
     m=plugin.tools; calls=[]
@@ -59,16 +57,22 @@ def test_argument_defaults(plugin,monkeypatch):
 @pytest.mark.parametrize('data,content', [({'contentMarkdown':' first ','markdown':'second'},'first'),({'markdown':'second'},'second'),({'text':'third'},'third'),({'content':'<p>fourth</p>'},'fourth'),({},'')])
 def test_defuddle_fields(plugin,monkeypatch,data,content):
     m=plugin.tools
+    monkeypatch.setattr(m,'guarded_fetch',lambda *a:(b'<html>body</html>',{},'https://a'))
     monkeypatch.setattr(m.shutil,'which',lambda x:'/fake')
     calls=[]
     monkeypatch.setattr(m.subprocess,'run',lambda *a,**k:calls.append((a,k)) or SimpleNamespace(returncode=0,stdout=json.dumps(data),stderr=''))
     out=m._run_defuddle('https://a',7,99)
     assert out['content']==content and out['ok']==bool(content)
-    assert calls[0][0][0]==['defuddle','parse','--json','https://a'] and calls[0][1]['timeout']==7
+    command = calls[0][0][0]
+    assert command[:3] == ['defuddle','parse','--json']
+    assert command[3].endswith('/page.html') and not command[3].startswith('http')
+    assert calls[0][1]['timeout']==7
+    assert 'defuddle_offline.cjs' in calls[0][1]['env']['NODE_OPTIONS']
 
 @pytest.mark.parametrize('kind', ['missing','timeout','error','nonzero','plain','empty'])
 def test_defuddle_failures(plugin,monkeypatch,kind):
     m=plugin.tools
+    monkeypatch.setattr(m,'guarded_fetch',lambda *a:(b'<html>body</html>',{},'https://a'))
     monkeypatch.setattr(m.shutil,'which',lambda _:None if kind=='missing' else '/fake')
     def run(*a,**k):
         if kind=='timeout': raise m.subprocess.TimeoutExpired('x',3)
@@ -82,13 +86,11 @@ def test_defuddle_failures(plugin,monkeypatch,kind):
 
 def test_direct_http(plugin,monkeypatch):
     m=plugin.tools; seen=[]
-    class Response:
-        headers={'content-type':'TEXT/HTML'}
-        def __enter__(self):return self
-        def __exit__(self,*a):pass
-        def geturl(self):return 'https://final'
-        def read(self,n):seen.append(n);return b'<p>Hello world</p>'
-    monkeypatch.setattr(m.urllib.request,'urlopen',lambda req,timeout:Response())
+    def fetch(url, timeout, size, headers):
+        seen.append(size)
+        assert timeout == 7 and headers['User-Agent'] == m.USER_AGENT
+        return b'<p>Hello world</p>', {'content-type':'TEXT/HTML'}, 'https://final'
+    monkeypatch.setattr(m,'guarded_fetch',fetch)
     out=m._direct_http('https://a',7,5)
     assert out==dict(ok=True,method='direct_http',content='Hello',content_type='TEXT/HTML',final_url='https://final',truncated=True)
     assert seen==[1024*1024]
@@ -98,32 +100,19 @@ def test_direct_http(plugin,monkeypatch):
 @pytest.mark.parametrize('error',[urllib.error.HTTPError('https://a',404,'Gone',{},None),RuntimeError('boom')])
 def test_direct_error(plugin,monkeypatch,error):
     def fail(*a,**k):raise error
-    monkeypatch.setattr(plugin.tools.urllib.request,'urlopen',fail)
+    monkeypatch.setattr(plugin.tools,'guarded_fetch',fail)
     out=plugin.tools._direct_http('https://a',1,1)
     assert out['ok'] is False and ('404' in out['error'] if isinstance(error,urllib.error.HTTPError) else out['error']=='boom')
 
-@pytest.mark.parametrize('shape',[{'results':[{'content':' abc ','title':'T','url':'https://b'}]}, {'data':[{'markdown':' abc ','title':'T','url':'https://b'}]}])
-def test_tinyfish(plugin,monkeypatch,shape):
-    seen=[]
-    monkeypatch.setattr(plugin.tools,'_HIDDEN_TINYFISH_DISPATCH',lambda a:seen.append(a) or json.dumps(shape))
-    out=plugin.tools._tinyfish_fetch('https://a',3,2,60,None)
-    assert out['ok'] and out['content']=='ab' and out['truncated'] and out['final_url']=='https://b' and out['title']=='T'
-    assert seen==[dict(urls=['https://a'],format='markdown',links=False,image_links=False,include_html_head=False,ttl=60)]
 
-def test_tinyfish_dispatch_fallback(plugin,monkeypatch):
-    monkeypatch.setattr(plugin.tools,'_HIDDEN_TINYFISH_DISPATCH',None)
-    assert not plugin.tools._tinyfish_fetch('https://a',1,1,None,None)['ok']
-    names=[]
-    def dispatch(name,args):
-        names.append(name)
-        assert 'ttl' not in args
-        if len(names)<3: raise RuntimeError('missing')
-        return {'results':[{'text':'ok'}]}
-    out=plugin.tools._tinyfish_fetch('https://a',1,10,None,SimpleNamespace(dispatch_tool=dispatch))
-    assert out['ok'] and names==['mcp_tinyfish_fetch_content','tinyfish_fetch_content','fetch_content']
+def test_remote_fetch_disabled(plugin,monkeypatch):
+    monkeypatch.setattr(plugin.tools, '_HIDDEN_TINYFISH_DISPATCH', lambda *a: pytest.fail('must not delegate'))
+    out=plugin.tools._tinyfish_fetch('https://example.com',3,99,None,None)
+    assert not out['ok'] and 'redirect' in out['error']
 
-@pytest.mark.parametrize('data,error',[({'results':[{'error':'blocked'}]},'blocked'),('junk','unexpected'),({},'unexpected')])
-def test_tinyfish_bad_response(plugin,monkeypatch,data,error):
-    monkeypatch.setattr(plugin.tools,'_HIDDEN_TINYFISH_DISPATCH',lambda a:data)
-    out=plugin.tools._tinyfish_fetch('https://a',1,10,None,None)
-    assert not out['ok'] and error in out['error']
+
+def test_rendered_mode_returns_browser_guidance_without_fetch(plugin,monkeypatch):
+    for name in ['_run_defuddle','_direct_http','_tinyfish_fetch']:
+        monkeypatch.setattr(plugin.tools,name,lambda *a:pytest.fail('rendered must not fetch'))
+    out=json.loads(plugin.tools.web_fetch({'url':'https://example.com','mode':'rendered'}))
+    assert not out['success'] and out['needs_browser'] and 'redirect' in out['error']

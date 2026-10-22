@@ -3,18 +3,17 @@
 The provider owns the HTTP calls instead of delegating to Hermes' bundled
 providers because their transport timeouts are too long for a strict fusion
 SLA. Calls are bounded at the HTTP layer, run concurrently, and fused within
-a soft window. Exa, TinyFish, and locally paced Brave form the fusion set.
-If no provider succeeds in the soft window, collection continues until the
-first useful result or a bounded hard deadline.
-
-Firecrawl is deliberately absent. Its search endpoint bills 2 credits per 10
-results, so routine fusion participation spent a metered quota to duplicate
-rows the free providers already returned.
+a soft window. TinyFish, Serper, paced Brave, Tavily, DeepSeek, and optional
+DDGS form the active roster. Exa and MWMBL clients are inactive. If no provider
+succeeds in the soft window, collection continues until the first useful result
+or a bounded hard deadline. Search never uses Firecrawl.
 """
 
 from __future__ import annotations
 
 import concurrent.futures
+from contextvars import copy_context
+from functools import partial
 import json
 import logging
 import os
@@ -35,9 +34,11 @@ from agent.web_search_provider import WebSearchProvider, get_provider_env
 try:
     from .turn_routing import ROUTER, decision_context
     from .shadow import SHADOW
+    from .paths import hermes_home
 except ImportError:  # standalone provider smoke / scripts
     from turn_routing import ROUTER, decision_context
     from shadow import SHADOW
+    from paths import hermes_home
 
 logger = logging.getLogger(__name__)
 
@@ -52,11 +53,7 @@ _DEEPSEEK_ENDPOINT = "https://api.deepseek.com/v1/tools/search"
 # under contention the later ones are the first to be refused admission. Fast
 # JSON APIs come first; ddgs is last because it is CPU-heavy HTML scraping that
 # would otherwise starve them (see _PROVIDER_MAX_INFLIGHT["ddgs"]).
-# mwmbl removed from the roster (Sep 2026): over 6,173 clicked results in six
-# months of gateway logs it supplied 0.2% of clicked URLs and 0 unique ones,
-# while 73% of its rows scored p<0.2 on an offline Jev relevance pass. The
-# client (_mwmbl_search) stays so it can be re-added if the index improves.
-# exa removed (Sep 2026): account out of credit, HTTP 402 again; client kept for re-adding.
+# Exa and MWMBL clients remain experimental/inactive and are not dispatched.
 _PROVIDER_ORDER = ("tinyfish", "serper", "brave-free", "tavily", "deepseek", "ddgs")
 _PROVIDER_MAX_INFLIGHT = {
     "exa": 8,
@@ -68,20 +65,12 @@ _PROVIDER_MAX_INFLIGHT = {
     # rate_paced. Capping this at 1 rejected legitimate queued turns as
     # concurrency_limited and silently degraded fusion to two providers.
     "brave-free": 3,
-    # Locally expensive, not upstream-limited: ddgs scrapes and parses HTML
-    # across rotating backends, costing 1.4-3.4s under concurrency while the
-    # JSON providers answer in ~0.4s. Measured over a 5-way burst, allowing 6
-    # in flight pushed wall time 1.68s -> 2.97s and dropped quorum from 5/5 to
-    # 1/5. Cap it low: excess callers are refused instantly (cheap) instead of
-    # spawning slow work that the quorum will not wait for anyway. Single
-    # searches, the common case, still get DuckDuckGo.
+    # Keep CPU-heavy HTML scraping below the keyed JSON providers' concurrency
+    # so excess callers do not spawn work that collection will not wait for.
     "ddgs": 2,
-    # Community-run and donation-funded: measured 24/24 under a 6-way burst,
-    # but stay deliberately modest out of courtesy to a volunteer index.
+    # Inactive community index: retain a modest experimental concurrency cap.
     "mwmbl": 4,
-    # Metered. Measured 12/12 clean under a 12-way burst, so the cap here is a
-    # cost control rather than a reliability one -- it bounds how much a single
-    # burst can spend. The monthly ceiling in _MONTHLY_BUDGET is the real guard.
+    # Metered providers bound burst spending as well as monthly attempts.
     "serper": 4,
     "tavily": 3,
     "deepseek": 4,
@@ -105,12 +94,7 @@ _PROVIDER_WEIGHTS = {
     # as an independent corroborating signal, but it must never outrank a
     # major index on its own.
     "mwmbl": 0.75,
-    # Serper is Google's own SERP: the strongest single ranking signal in the
-    # set, and measured fastest (938ms median). Weighted highest accordingly.
-    # 1.10 -> 1.40 after the 2026-08-04 offline grid eval (24 queries, blind
-    # nDCG@5 judging): +0.0015 mean, 2 queries improved, 0 regressed. Higher
-    # serper weight preserves Google's rank-1 picks (official docs) that flat
-    # RRF consensus was diluting; rrf_k and rank-1 bonus showed no gain.
+    # Favor the Serper ranking signal while retaining consensus contributions.
     "serper": 1.40,
     # Tavily ranks for LLM-answer relevance rather than raw web authority,
     # which makes it a useful but slightly different signal. Held at parity.
@@ -177,7 +161,7 @@ class FusionSettings:
     rrf_k: int = 60
     turn_routing_enabled: bool = True
     auto_retry_enabled: bool = True
-    shadow_enabled: bool = True
+    shadow_enabled: bool = False
     shadow_daily_cap: int = 300
     shadow_timeout_s: float = 3.0
     turn_idle_gap_s: float = 120.0
@@ -233,7 +217,7 @@ def load_fusion_settings() -> FusionSettings:
         rrf_k=_bounded_int(raw.get("rrf_k"), 60, 1, 1000),
         turn_routing_enabled=str(os.getenv("SEARCH_FUSION_TURN_ROUTING", raw.get("turn_routing_enabled", True))).lower() not in {"0", "false", "off", "no"},
         auto_retry_enabled=str(os.getenv("SEARCH_FUSION_AUTO_RETRY", raw.get("auto_retry_enabled", True))).lower() not in {"0", "false", "off", "no"},
-        shadow_enabled=str(raw.get("shadow_enabled", True)).lower() not in {"0", "false", "off", "no"},
+        shadow_enabled=str(os.getenv("SEARCH_FUSION_SHADOW", raw.get("shadow_enabled", False))).lower() not in {"0", "false", "off", "no"},
         shadow_daily_cap=_bounded_int(raw.get("shadow_daily_cap"), 300, 0, 10000),
         shadow_timeout_s=_bounded_float(raw.get("shadow_timeout_s"), 3.0, 0.1, 10.0),
         turn_idle_gap_s=_bounded_float(raw.get("turn_idle_gap_s"), 120.0, 1.0, 3600.0),
@@ -335,13 +319,7 @@ def _exa_search(query: str, limit: int, timeout_s: float) -> list[dict[str, Any]
 
 
 def _serper_search(query: str, limit: int, timeout_s: float) -> list[dict[str, Any]]:
-    """Google SERP via Serper. Metered, but the cheapest measured option.
-
-    Prepaid credits (no subscription floor) at $0.30-1.00 per 1,000 queries,
-    billed 1 credit per search. Measured 8/8 usable across varied queries at a
-    938ms median -- the fastest keyed provider in the set -- and 12/12 clean
-    under a 12-way burst.
-    """
+    """Google SERP via Serper; metered requests share the local monthly cap."""
 
     key = get_provider_env("SERPER_API_KEY")
     if not key:
@@ -374,14 +352,7 @@ def _serper_search(query: str, limit: int, timeout_s: float) -> list[dict[str, A
 
 
 def _tavily_search(query: str, limit: int, timeout_s: float) -> list[dict[str, Any]]:
-    """Tavily. 1,000 free credits per month, renewed, no card required.
-
-    A basic search costs 1 credit and an advanced search 2, so this deliberately
-    pins ``search_depth`` to basic: fusion wants a cheap independent opinion,
-    not Tavily's own summarisation. Budget enforcement lives in the admission
-    layer (see ``_MONTHLY_BUDGET``), because the free tier covers well under
-    measured ~5,400 searches/month and must not fail open into billing.
-    """
+    """Tavily basic search; omit answer generation and enforce a local cap."""
 
     key = get_provider_env("TAVILY_API_KEY")
     if not key:
@@ -463,16 +434,7 @@ def _mwmbl_flatten(value: Any) -> str:
 
 
 def _mwmbl_search(query: str, limit: int, timeout_s: float) -> list[dict[str, Any]]:
-    """mwmbl — a community-run, fully open-source, keyless index.
-
-    Chosen over Marginalia's public API: both answer quickly, but Marginalia's
-    operator states the shared ``public`` key is "intended for implementation
-    testing and not actual sustained use", and it degraded under a measured
-    24-request burst (10 ok, 5x HTTP 424, 9 timeouts). mwmbl returned 24/24.
-
-    Its index is small and independent of the big crawlers, which is exactly
-    what makes it useful for corroboration rather than as a primary source.
-    """
+    """Inactive experimental client for the independent, community-run MWMBL index."""
 
     response = _HTTP_CLIENT.get(
         _MWMBL_ENDPOINT,
@@ -523,11 +485,7 @@ def _ddgs_available() -> bool:
 def _ddgs_search(query: str, limit: int, timeout_s: float) -> list[dict[str, Any]]:
     """DuckDuckGo via the ``ddgs`` package. No API key.
 
-    Deliberately in-process rather than shelling out to the ``ddgr`` CLI:
-    measured side by side, ``ddgr`` began returning "HTTP Error 202: Accepted"
-    after two queries and — worse — still exited 0 with an empty JSON array,
-    which is indistinguishable from a genuine no-results answer. ``ddgs``
-    rotates backends and survived the same burst cleanly.
+    Run in-process to distinguish provider failures from empty CLI output.
 
     ``ddgs`` has no overall wall-clock cap of its own (its multi-engine retry
     loop can run long past the per-request timeout), so the router's own
@@ -703,10 +661,8 @@ def _classify_provider_exception(
         if status_code in {401, 403}:
             return "auth_error", f"provider authentication failed (HTTP {status_code})", 900.0
         if status_code == 402:
-            # Exa returned 402 on 271 searches (Jul-Aug 2026) while its
-            # balance was empty; each one burned a slot and a timeout for a
-            # response that cannot change until someone tops up. Treat it as
-            # an account problem like 401/403, not a transient error.
+            # Payment-required responses need account intervention; use the
+            # authentication circuit instead of repeatedly occupying slots.
             return "auth_error", "provider account out of credit (HTTP 402); top up or disable it", 900.0
         return "error", f"provider returned HTTP {status_code}", None
     return "error", f"provider request failed ({type(exc).__name__})", None
@@ -852,40 +808,25 @@ class _ProviderCoordinator:
 
 _PROCESS_COORDINATOR = _ProviderCoordinator()
 
-# One shared worker pool for every search in the process.
-#
-# Previously each search built its own ThreadPoolExecutor and tore it down with
-# shutdown(wait=False), which is required to honour the collection deadlines but
-# leaves tardy workers running. Under a 5-way concurrent burst that meant ~35
-# fresh OS threads created at once while the previous search's stragglers were
-# still alive, and *every* provider slowed to ~3.3s uniformly -- including mwmbl,
-# which answers in ~0.11s on its own. The tell was that the slowdown was equal
-# across providers: shared contention, not any one index being slow. (Measured
-# and rejected the obvious alternative first: ddgs's HTML parsing starving the
-# GIL only cost co-running I/O 1.1x, so it was not the cause.)
-#
-# A bounded shared pool amortises thread creation and caps total concurrent
-# provider work regardless of how many searches are in flight. Threads are
-# daemon-ish by pool default and idle cheaply between searches.
+# One bounded shared pool amortises thread creation and limits concurrent work
+# across searches. Tardy provider calls keep their slots until completion.
 _SHARED_EXECUTOR = concurrent.futures.ThreadPoolExecutor(
     max_workers=max(8, len(_PROVIDER_ORDER) * 3),
     thread_name_prefix="search-fusion",
 )
 
-# Monthly spend ceilings for metered providers, keyed by provider name.
-# Fusion queries every provider on every search, so a metered provider left
-# ungoverned bills on all ~5,400 measured searches/month. Firecrawl was removed
-# from this router for exactly that reason; these two stay only because the
-# ceiling is enforced here rather than trusted upstream.
-#
-# tavily: the free plan grants 1,000 credits/month and a basic search costs 1.
-#   Held just under the grant so the free tier can never roll into paid usage.
-# serper: prepaid credits at $0.30-1.00/1k. 6,000 covers the measured volume
-#   with headroom for well under $10/month, and caps a runaway loop.
-# DeepSeek: 10,000 attempted searches <= $7.50 at $0.75/1k successful calls.
-# Failed/empty calls still count locally: conservative, no automatic retries.
+# Conservative local monthly attempted-request ceilings. These are cost controls,
+# not account balances or guarantees about current upstream pricing/allowances.
+# Failed and empty requests count locally too; shadow uses the same allowance.
 _MONTHLY_BUDGET = {"tavily": 950, "serper": 6000, "deepseek": 10000}
-_BUDGET_STATE_PATH = Path.home() / ".hermes" / "state" / "fusion-provider-budget.json"
+# Optional override for isolated consumers/tests; normal paths resolve at call time.
+_BUDGET_STATE_PATH: Path | None = None
+_BUDGET_CACHE_PATH: Path | None = None
+
+
+def _budget_state_path() -> Path:
+    return _BUDGET_STATE_PATH if _BUDGET_STATE_PATH is not None else hermes_home() / "state/fusion-provider-budget.json"
+
 _BUDGET_LOCK = threading.Lock()
 _BUDGET_CACHE: dict[str, Any] = {}
 
@@ -897,8 +838,8 @@ def _budget_period() -> str:
 def _persist_budget() -> None:
     """Persist while the caller holds _BUDGET_LOCK; retain in-memory fallback."""
     try:
-        _BUDGET_STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
-        _BUDGET_STATE_PATH.write_text(json.dumps(_BUDGET_CACHE))
+        _budget_state_path().parent.mkdir(parents=True, exist_ok=True)
+        _budget_state_path().write_text(json.dumps(_BUDGET_CACHE))
     except Exception:  # noqa: BLE001 — never fail a search on bookkeeping
         logger.debug("fusion: could not persist provider budget", exc_info=True)
 
@@ -913,16 +854,21 @@ def _budget_allows(
     Unmetered providers are always allowed.
     """
 
+    global _BUDGET_CACHE_PATH
     limit = _MONTHLY_BUDGET.get(name)
     if limit is None:
         return True
 
     period = _budget_period()
     with _BUDGET_LOCK:
+        path = _budget_state_path()
+        if _BUDGET_CACHE_PATH is not None and _BUDGET_CACHE_PATH != path:
+            _BUDGET_CACHE.clear()
+        _BUDGET_CACHE_PATH = path
         if _BUDGET_CACHE.get("period") != period:
             loaded: dict[str, Any] = {}
             try:
-                loaded = json.loads(_BUDGET_STATE_PATH.read_text())
+                loaded = json.loads(path.read_text())
             except Exception:  # noqa: BLE001 — missing/corrupt state starts fresh
                 loaded = {}
             if loaded.get("period") != period:
@@ -958,7 +904,7 @@ def _budget_allows(
         return True
 
 # Pay the ddgs import cost at module load, not inside the first provider
-# worker. See _ddgs_available() for the measurement.
+# worker; availability is cached for later dispatch.
 _ddgs_available()
 
 
@@ -1259,7 +1205,7 @@ class SearchFusionWebSearchProvider(WebSearchProvider):
         def submit(name: str, searcher: SearchFn, lease: _AdmissionLease) -> None:
             try:
                 future = executor.submit(
-                    self._invoke,
+                    partial(copy_context().run, self._invoke),
                     name,
                     searcher,
                     query,
@@ -1303,11 +1249,9 @@ class SearchFusionWebSearchProvider(WebSearchProvider):
         dispatched: set[str] = set()
         transient_refusals = dispatch_round(provider_order)
 
-        # Burst admission: a parallel batch of searches in one turn used to be
-        # refused outright when every slot was busy, failing in <50ms without
-        # spending any of the quorum window (1,244 such failures Jul-Aug 2026).
-        # With no results, admission gets the full first-result window; the
-        # shorter quorum window only bounds waiting for corroboration.
+        # Busy slots can clear during a parallel batch. With no results,
+        # admission gets the full first-result window; the shorter quorum
+        # window only bounds waiting for corroboration.
         admission_polls = 0
         while not pending and transient_refusals:
             remaining = hard_deadline - time.monotonic()

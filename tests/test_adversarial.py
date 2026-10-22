@@ -166,9 +166,12 @@ def test_ats_host_and_page_boundaries_preserve_generic_path(plugin, monkeypatch,
     cfg = dict(firecrawl_hosts=set(), skip_firecrawl_hosts=set(), timeout_s=7,
                max_chars=1000, min_local_chars=200)
     result = asyncio.run(m.FrugalExtractProvider(cfg).extract([url]))[0]
-    assert calls == [url]
-    assert result['metadata']['extract_method'] == 'direct_http'
-    assert result['content'] == generic
+    if '@127.0.0.1' in url:
+        assert calls == [] and 'embedded credentials' in result['error']
+    else:
+        assert calls == [url]
+        assert result['metadata']['extract_method'] == 'direct_http'
+        assert result['content'] == generic
 
 
 @pytest.mark.parametrize('blocked_at', ['lock', 'persist'])

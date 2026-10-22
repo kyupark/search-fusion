@@ -3,14 +3,18 @@
 from __future__ import annotations
 
 import json
+import os
+from pathlib import Path
 import re
 import shutil
 import subprocess
+import tempfile
 import urllib.error
 import urllib.parse
-import urllib.request
 from html import unescape
 from typing import Any
+
+from .url_safety import UnsafeURL, guarded_fetch, validate_url
 
 RAW_EXTENSIONS = {
     ".md",
@@ -82,12 +86,12 @@ def _html_to_text(html: str) -> str:
 
 
 def _direct_http(url: str, timeout: int, max_chars: int) -> dict[str, Any]:
-    req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT, "Accept": "*/*"})
     try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
-            raw = resp.read(max(max_chars * 4, 1024 * 1024) if max_chars > 0 else 10 * 1024 * 1024)
-            content_type = resp.headers.get("content-type", "")
-            final_url = resp.geturl()
+        raw, headers, final_url = guarded_fetch(
+            url, timeout, max(max_chars * 4, 1024 * 1024) if max_chars > 0 else 10 * 1024 * 1024,
+            {"User-Agent": USER_AGENT, "Accept": "*/*"},
+        )
+        content_type = headers.get("content-type", "")
     except urllib.error.HTTPError as e:
         return {"ok": False, "error": f"HTTP {e.code}: {e.reason}", "method": "direct_http"}
     except Exception as e:
@@ -111,13 +115,21 @@ def _run_defuddle(url: str, timeout: int, max_chars: int) -> dict[str, Any]:
     if not shutil.which("defuddle"):
         return {"ok": False, "method": "defuddle", "error": "defuddle binary not found on PATH"}
     try:
-        proc = subprocess.run(
-            ["defuddle", "parse", "--json", url],
-            check=False,
-            capture_output=True,
-            text=True,
-            timeout=timeout,
+        raw, _, final_url = guarded_fetch(
+            url, timeout, 10 * 1024 * 1024,
+            {"User-Agent": USER_AGENT, "Accept": "text/html,*/*"},
         )
+        # The CLI must never receive a URL: it otherwise follows redirects internally.
+        # A preload also blocks secondary HTTP/TLS/socket requests from async extractors.
+        env = dict(os.environ)
+        env["NODE_OPTIONS"] = "--require " + json.dumps(str(Path(__file__).with_name("defuddle_offline.cjs")))
+        with tempfile.TemporaryDirectory(prefix="search-fusion-html-") as temp:
+            source = Path(temp) / "page.html"
+            source.write_bytes(raw)
+            proc = subprocess.run(
+                ["defuddle", "parse", "--json", str(source)],
+                check=False, capture_output=True, text=True, timeout=timeout, env=env,
+            )
     except subprocess.TimeoutExpired:
         return {"ok": False, "method": "defuddle", "error": f"timeout after {timeout}s"}
     except Exception as e:
@@ -139,6 +151,7 @@ def _run_defuddle(url: str, timeout: int, max_chars: int) -> dict[str, Any]:
             "content": text,
             "truncated": truncated,
             "warning": "defuddle_non_json_output",
+            "final_url": final_url,
         }
 
     content = (data.get("contentMarkdown") or data.get("markdown") or data.get("text") or "").strip()
@@ -155,72 +168,15 @@ def _run_defuddle(url: str, timeout: int, max_chars: int) -> dict[str, Any]:
         "published": data.get("published") or "",
         "language": data.get("language") or "",
         "word_count": data.get("wordCount"),
+        "final_url": final_url,
         "truncated": truncated,
     }
 
 
 def _tinyfish_fetch(url: str, timeout: int, max_chars: int, ttl: int | None, plugin_ctx: Any) -> dict[str, Any]:
-    dispatchers = []
-    if _HIDDEN_TINYFISH_DISPATCH is not None:
-        dispatchers.append(("hidden_tinyfish_fetch", _HIDDEN_TINYFISH_DISPATCH))
-    if plugin_ctx is not None and hasattr(plugin_ctx, "dispatch_tool"):
-        dispatchers.extend(
-            (tool_name, lambda call_args, _tool_name=tool_name: plugin_ctx.dispatch_tool(_tool_name, call_args))
-            for tool_name in ("mcp_tinyfish_fetch_content", "tinyfish_fetch_content", "fetch_content")
-        )
-    if not dispatchers:
-        return {"ok": False, "method": "tinyfish_fetch", "error": "plugin dispatch context unavailable"}
-
-    args: dict[str, Any] = {
-        "urls": [url],
-        "format": "markdown",
-        "links": False,
-        "image_links": False,
-        "include_html_head": False,
-    }
-    if ttl is not None:
-        args["ttl"] = ttl
-
-    for tool_name, dispatcher in dispatchers:
-        try:
-            raw = dispatcher(args)
-        except Exception as e:
-            last_error = str(e)
-            continue
-        try:
-            data = json.loads(raw) if isinstance(raw, str) else raw
-        except Exception:
-            data = {"raw": raw}
-
-        # Expected TinyFish shape: {"results": [{"url", "title", "content", "error"}], "errors": ...}
-        result = None
-        if isinstance(data, dict):
-            results = data.get("results") or data.get("data") or []
-            if isinstance(results, list) and results:
-                result = results[0]
-        if isinstance(result, dict):
-            if result.get("error"):
-                return {"ok": False, "method": "tinyfish_fetch", "error": str(result.get("error"))}
-            content = str(result.get("content") or result.get("markdown") or result.get("text") or "").strip()
-            content, truncated = _clip(content, max_chars)
-            return {
-                "ok": bool(content),
-                "method": "tinyfish_fetch",
-                "content": content,
-                "title": result.get("title") or "",
-                "final_url": result.get("url") or url,
-                "truncated": truncated,
-                "tool_name": tool_name,
-            }
-
-        return {
-            "ok": False,
-            "method": "tinyfish_fetch",
-            "error": "unexpected TinyFish response shape",
-            "tool_name": tool_name,
-        }
-
-    return {"ok": False, "method": "tinyfish_fetch", "error": locals().get("last_error", "TinyFish fetch tool not registered")}
+    # A remote fetch service cannot expose/validate every redirect or pin our DNS answers.
+    return {"ok": False, "method": "tinyfish_fetch",
+            "error": "remote fetching disabled: redirect destinations cannot be validated"}
 
 
 def _success(url: str, result: dict[str, Any], attempts: list[dict[str, Any]], warnings: list[str]) -> str:
@@ -252,17 +208,19 @@ def web_fetch(args: dict[str, Any], *, plugin_ctx: Any = None, **_: Any) -> str:
         timeout = int(args.get("timeout") or 30)
     except Exception:
         timeout = 30
-    ttl = args.get("ttl")
-    try:
-        ttl = int(ttl) if ttl is not None else None
-    except Exception:
-        ttl = None
 
     if not _is_http_url(url):
         return _json({"success": False, "error": "web_fetch requires an absolute http(s) URL", "url": url})
+    try:
+        validate_url(url)
+    except UnsafeURL as exc:
+        return _json({"success": False, "error": str(exc), "url": url})
     if mode not in {"auto", "article", "raw", "rendered"}:
         return _json({"success": False, "error": f"invalid mode: {mode}", "url": url})
 
+    if mode == "rendered":
+        return _json({"success": False, "url": url, "needs_browser": True,
+                      "error": "rendered fetching unavailable: remote redirect safety cannot be enforced"})
     attempts: list[dict[str, Any]] = []
     warnings: list[str] = []
 
@@ -279,23 +237,17 @@ def web_fetch(args: dict[str, Any], *, plugin_ctx: Any = None, **_: Any) -> str:
     # Policy: Defuddle first for known normal URLs/articles/docs.
     defuddle = _run_defuddle(url, timeout, max_chars)
     attempts.append({"method": "defuddle", "ok": defuddle.get("ok"), "error": defuddle.get("error")})
-    if defuddle.get("ok") and mode != "rendered":
+    if defuddle.get("ok"):
         return _success(url, defuddle, attempts, warnings)
-    if defuddle.get("ok") and mode == "rendered":
-        warnings.append("rendered_mode_requested: trying TinyFish Fetch after successful Defuddle")
-    else:
-        warnings.append(f"defuddle_failed: {defuddle.get('error') or 'empty extraction'}")
+    warnings.append(f"defuddle_failed: {defuddle.get('error') or 'empty extraction'}")
 
-    tinyfish = _tinyfish_fetch(url, timeout, max_chars, ttl, plugin_ctx)
-    attempts.append({"method": "tinyfish_fetch", "ok": tinyfish.get("ok"), "error": tinyfish.get("error")})
-    if tinyfish.get("ok"):
-        return _success(url, tinyfish, attempts, warnings)
-    warnings.append(f"tinyfish_fetch_failed_or_unavailable: {tinyfish.get('error')}")
-
-    fallback_content = defuddle.get("content") if defuddle.get("ok") else ""
-    if fallback_content:
-        warnings.append("returning_defuddle_content_after_rendered_fallback_failed")
-        return _success(url, defuddle, attempts, warnings)
+    # A plain guarded GET remains useful when Defuddle is absent or cannot extract a page.
+    if not raw_first:
+        direct = _direct_http(url, timeout, max_chars)
+        attempts.append({"method": "direct_http", "ok": direct.get("ok"), "error": direct.get("error")})
+        if direct.get("ok"):
+            return _success(url, direct, attempts, warnings)
+        warnings.append(f"direct_http_failed: {direct.get('error')}")
 
     return _json(
         {

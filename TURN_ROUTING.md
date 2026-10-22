@@ -79,30 +79,7 @@ with per-round provider outcomes. Existing top-level provider/collection
 metadata describes the final round. Error diagnostics do not include exception
 bodies, request URLs, or credentials.
 
-## Verification
-
-Two real searches in one fresh interpreter, driven by the installed host's
-`PluginManager.invoke_hook` plus its real approval observability context:
-
-- First batch (`Python official documentation pathlib`): Fusion, 4 rows,
-  `providers_used=[serper, deepseek]`, wall **1877 ms**, collection **1876 ms**.
-- Later batch (`Python official documentation concurrent futures`): Serper only,
-  4 rows, `providers_used=[serper]`, wall **828 ms**, collection **825 ms**.
-- Both reported `turn_boundary=hook_ids`, no retry. First top URL was
-  `https://docs.python.org/3/library/pathlib.html`, with
-  `source_providers=[serper]`, `provider_ranks={serper: 1}`. The contributing
-  DeepSeek rows did not enter the requested top four; provider success is not
-  the same as final-row contribution.
-- Brave returned 429 and entered cooldown; Tavily's local budget was exhausted;
-  DDGS unavailable; TinyFish missed the soft collection deadline. These did not
-  prevent the successful query and correctly did not trigger retry.
-- Actual transport attempts: Serper 2, DeepSeek 1, TinyFish 1, Brave 1; no Tavily
-  or Fetch. Local budget was seeded into an isolated scratch ledger, never
-  overwriting the gateway's ledger. No vendor billing/balance audit performed.
-- Detailed smoke evidence:
-  (local evidence file, not included).
-
-## Log-only shadow Fusion (default ON)
+## Log-only shadow Fusion (default OFF; opt-in)
 
 A successful, nonempty later Serper-only batch enqueues an independent Fusion
 counterfactual. The returned object is never changed: the worker reuses a value
@@ -117,8 +94,9 @@ shadow_daily_cap: 300
 shadow_timeout_s: 3.0
 ```
 
-`SEARCH_FUSION_SHADOW=0` (also false/off/no) always disables shadow, including
-already queued jobs. No production configuration edit is required. A single
+`SEARCH_FUSION_SHADOW=1` or `shadow_enabled: true` explicitly enables shadow.
+`SEARCH_FUSION_SHADOW=0` (also false/off/no) always disables it, including
+already queued jobs. The environment setting takes precedence over configuration. A single
 daemon collector consumes an eight-job queue; full queues drop immediately.
 Six separate provider workers have a nonblocking submission bound, so timed-out
 transports cannot grow an unbounded executor backlog or use real-search worker
@@ -143,12 +121,14 @@ less than 20% of its monthly allowance remaining. The inherited monthly ledger
 is process-cached, not a distributed account-wide counter. Skipped admissions
 still consume the daily run cap; dropped jobs and budget/kill-switch skips do not.
 
-`~/.hermes/state/search-fusion/shadow.jsonl` stores timestamp, session/turn,
+`<Hermes home>/state/search-fusion/shadow.jsonl` stores timestamp, session/turn,
 observed batch index, query, Serper/Fusion/Fusion-only URLs, successful providers,
 per-provider status/latency, and only title/URL/snippet result fields (300 chars).
-Known provider credentials and labeled secrets are redacted; URL userinfo,
-query strings and fragments are discarded. No response/error bodies or headers
-are recorded. A 5 MiB file rotates to one backup (about 10 MiB total bound).
+Hermes home is resolved at use time through the host helper (including
+`HERMES_HOME`/profile overrides; fallback `~/.hermes`). Known provider credentials
+and labeled secrets are redacted; URL userinfo,
+query strings and fragments are discarded. Ordinary queries and result text remain sensitive and are not anonymized.
+No response/error bodies or headers are recorded. A 5 MiB file rotates to one backup (about 10 MiB total bound).
 Read-only report:
 
 ```sh
@@ -165,27 +145,12 @@ observed sequence without exact hook IDs (old batch IDs are bounded to 256).
 
 ### Offline verification
 
-Supported suite: **334 passed** versus the **318-test** baseline. New tests cover
-non-waiting/unchanged foreground results, Serper reuse, slot/worker/queue/cap/
-budget/switch skips, reserved DeepSeek capacity, hard deadline lease retention,
-log schema/redaction/rotation, persisted daily cap, configuration, negative
-routing paths, and read-only subsequent tool-call URL reporting.
+Run `python -m pytest -q -p no:cacheprovider tests` from this checkout with the
+Hermes environment active. The suite covers non-waiting submission, unchanged
+foreground results, Serper reuse, slot/worker/queue/daily/monthly-cap skips,
+opt-in defaults and kill switch, reserved foreground capacity, deadline lease
+retention, log schema/redaction/rotation and read-only URL reporting. All
+provider responses are local doubles; no live spending is needed.
 
-### Live shadow verification
-
-One paid foreground search, with the preceding first-batch routing identity
-primed without a transport: `Python official documentation concurrent futures ThreadPoolExecutor`.
-Returned four Serper-only results, wall **1347.02 ms**, collection/routing
-**1331 ms**, shadow enqueue **0.0415 ms**. Shadow TinyFish took **2531 ms**,
-DeepSeek **584 ms**; neither was awaited by the foreground. A real shadow log
-line was read back. This establishes non-waiting submission, not a statistical
-before/after latency claim. Actual transports: Serper 1, DeepSeek 1, TinyFish 1,
-Brave 1 (429); Tavily budget exhausted and DDGS unavailable. The monthly ledger
-was seeded into scratch, never replacing the gateway ledger. DeepSeek theoretical
-cost $0.00075 plus one Serper credit; no balance-delta billing audit.
-Evidence: (local evidence file, not included).
-
-## Activation
-
-Files and fresh-interpreter tests do not activate code in the running gateway.
-An approved gateway restart is needed. No restart is performed by this change.
+Code/configuration changes take effect in a new session or after restarting a
+long-running host. This plugin does not restart the host or edit its settings.

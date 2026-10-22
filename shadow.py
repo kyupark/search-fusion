@@ -2,6 +2,8 @@
 from __future__ import annotations
 
 import concurrent.futures as futures
+from contextvars import copy_context
+from functools import partial
 from dataclasses import replace
 import json
 import os
@@ -14,7 +16,10 @@ import time
 from urllib.parse import urlsplit, urlunsplit
 
 OFF = {"0", "false", "off", "no"}
-STATE = Path.home() / ".hermes/state/search-fusion"
+try:
+    from .paths import hermes_home
+except ImportError:  # standalone scripts
+    from paths import hermes_home
 
 
 def enabled(settings):
@@ -42,8 +47,8 @@ def safe_url(value, secrets=()):
 
 
 class ShadowRunner:
-    def __init__(self, state=STATE, queue_size=8, autostart=True):
-        self.state = Path(state)
+    def __init__(self, state=None, queue_size=8, autostart=True):
+        self._state = Path(state) if state is not None else None
         self.queue = queue.Queue(maxsize=queue_size)
         # Separate from real search executor, plus a nonblocking submission bound:
         # tardy sockets cannot create an unbounded executor queue.
@@ -54,6 +59,10 @@ class ShadowRunner:
             self.worker = threading.Thread(target=self._worker, daemon=True, name="fusion-shadow")
             self.worker.start()
 
+    @property
+    def state(self):
+        return self._state if self._state is not None else hermes_home() / "state/search-fusion"
+
     def submit(self, provider, query, limit, settings, result, context):
         if not enabled(settings):
             return False
@@ -61,7 +70,7 @@ class ShadowRunner:
         rows = [{k: row.get(k, "") for k in ("url", "title", "description")}
                 for row in result["data"]["web"][:50]]
         job = (provider, query, limit, settings, rows, dict(context), time.time(),
-               next((a.get("elapsed_ms", 0) for a in result.get("metadata", {}).get("fusion_attempts", []) if a.get("provider") == "serper"), 0))
+               next((a.get("elapsed_ms", 0) for a in result.get("metadata", {}).get("fusion_attempts", []) if a.get("provider") == "serper"), 0), copy_context())
         try:
             self.queue.put_nowait(job)
             return True
@@ -118,6 +127,10 @@ class ShadowRunner:
             return True
 
     def run(self, job):
+        # Preserve the submitting Hermes profile across the background queue.
+        job[-1].run(self._run, job[:-1])
+
+    def _run(self, job):
         provider, query, limit, settings, rows, context, ts, serper_ms = job
         f = sys.modules[type(provider).__module__]
         if not enabled(settings):
@@ -152,7 +165,7 @@ class ShadowRunner:
                         self.slots.release()
                     else:
                         try:
-                            future = self.pool.submit(provider._invoke, name, provider._searchers[name],
+                            future = self.pool.submit(partial(copy_context().run, provider._invoke), name, provider._searchers[name],
                                                       query, limit, settings, lease, cancelled)
                         except Exception:
                             lease.finish("cancelled", settings)
